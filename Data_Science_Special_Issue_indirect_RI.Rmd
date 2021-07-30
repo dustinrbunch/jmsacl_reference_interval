@@ -1,0 +1,633 @@
+---
+title: "Indirect_Reference_Interval"
+author: "Dustin Bunch"
+date: "July 19, 2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(readxl) 
+library(tidyverse)
+library(janitor)
+library(bestNormalize)
+library(mixtools)
+library(fitdistrplus)
+library(mosaic)
+library(lubridate)
+library(eeptools)
+library(stringr)
+```
+```{r functions}
+##### Filters data based on defined parameters (specific to use case) #####
+data.filter <- function(x) {
+  library(stringr)
+  x %>%
+  filter(str_detect(loc_name, "^OP")  )
+}
+
+##### Data analysis for gaussian distrubution with histogram, kurtosis, and skewness #####
+data.test <- function(x) {
+  if (length(x) <= 5) {
+  "N <= 5"
+  } else{
+  fitdistrplus::plotdist(as.numeric(na.omit(x)),
+  histo = TRUE,
+  demp = TRUE)
+  fitdistrplus::descdist(as.numeric(na.omit(x)),
+  boot = 1000)
+  }
+}
+
+##### Tukey outlier removal function #####
+remove.outlier <- function(x, na.rm = TRUE) {
+
+  ## Find 25% and 75% Quantiles 
+  quant <- quantile(
+                x, 
+                probs = c(.25, .75), 
+                na.rm = na.rm
+                )
+  
+  ## Find interquantile range and multiply it by 1.5
+  tukey <- 1.5 * IQR(
+                    x, 
+                    na.rm = na.rm
+                    )
+  
+  y <- x
+  
+  ## Replace outliers with NA
+  y[x < (quant[1] - tukey)] <- NA
+  y[x > (quant[2] + tukey)] <- NA
+  #
+  return(y)
+}
+
+##### Yeo Johnson Data Transformation #####
+data.tran <- function(x) {
+ if(is.numeric(x) == TRUE) 
+ {
+  bestNormalize::yeojohnson(x)
+ }
+}
+
+##### Mixtool function with standardized parameters #####
+mixtool.drb <- function(x) {
+  mosaic::resample(x)
+  if (inherits(res4 <-
+  try(normalmixEM(
+  na.omit(x),
+  k = 2,
+  maxit =  30000,
+  maxrestarts = 25
+  ))
+  , "try-error")) {
+  mixtool.drb(x)
+  
+  } else{
+  res4
+  }
+  
+}
+
+##### Calculate limits based on the mixtool output #####
+mixtool.limits <- function(x) {
+  print(x)
+  if( inherits(res1 <- try(if (x[['lambda']][1] > 0.5) {
+  #find the 2.5th 97.5th percentile from the mixed model fit
+  lower.limit <- qnorm(0.025, x[['mu']][1],   x[['sigma']][1])
+  upper.limit <-
+  qnorm(0.975,
+  x[['mu']][1],
+  x[['sigma']][1])
+  lambda.fit <-
+  x[['lambda']][1]
+  } else {
+  #find the 2.5th 97.5th percentile from the mixed model fit
+  lower.limit <-
+  qnorm(0.025,
+  x[['mu']][2],
+  x[['sigma']][2])
+  upper.limit <-
+  qnorm(0.975,
+  x[['mu']][2],
+  x[['sigma']][2])
+  lambda.fit <-
+  x[['lambda']][2]
+  }), "try-error")){
+    FALSE
+  }else{
+      res1}
+  if( inherits(res2 <- try(ref.limits <- list(
+  "N" = as.numeric(sum(!is.na(x$x))),
+  "lower.limit" = as.numeric(lower.limit),
+  "upper.limit" = as.numeric(upper.limit),
+  "lambda" =  as.numeric(lambda.fit)
+  )), "try-error")){
+    FALSE
+  }else{
+      res2
+        }
+}
+
+##### Function to convert the transformed data back to original values #####
+##### x is data that is to be converted. y is from the data transformation output #####
+backtransform2 <- function(x, y) {
+
+x.new <- list() 
+  if (inherits(res <- try(for (i in 1:length(x)) {
+ 
+  x[[i]][["lower.limit"]] <-
+  predict(y,
+  x[[i]][["lower.limit"]],
+  inverse =  TRUE)
+  x[[i]][["upper.limit"]] <-
+  predict(y,
+  x[[i]][["upper.limit"]],
+  inverse =  TRUE)
+  
+  x.new[[i]] <- x[[i]]
+ 
+  })
+  , "try-error")) {
+  FALSE
+  } else{
+  res
+  }
+  
+  # crush to flat matrix
+  my_mat <- do.call(rbind, x.new)
+  my_df <- data.frame(my_mat)
+  
+}
+
+notransform <- function(x){
+  x.new <- list()
+  if (inherits(res2 <- try(for (i in 1:length(x)) {
+  
+  x[[i]][["lower.limit"]] <-  x[[i]][["lower.limit"]]
+  x[[i]][["upper.limit"]] <-  x[[i]][["upper.limit"]]
+  
+  
+  x.new[[i]] <- x[[i]]
+  
+  }), "try-error")) {
+  FALSE
+  } else{
+  res2
+  }
+  
+  # crush to flat matrix
+  mydataframe <- data.frame(do.call(rbind, x.new))
+  }
+  
+
+
+##### CSV output to results folder. x is data. y is file name. #####
+csv.out <- function(x, y){
+  write.csv(x, file = here::here("results",  paste0( y,
+format(Sys.time(), "%Y-%m-%d_%k.%M%S"),".csv" )), row.names = FALSE) 
+}
+```
+```{r data_import}
+indirect_ref_int<- read_xlsx(here::here("data",
+                                   "jmsacl_example_dataset.xlsx")) %>%
+                                   janitor::clean_names()
+#check datatypes
+glimpse(indirect_ref_int)
+
+#adjust datatypes
+indirect_ref_int$birthdate_odbc <- janitor::convert_to_datetime(indirect_ref_int$birthdate_odbc)
+indirect_ref_int$collectdatetime <- janitor::convert_to_datetime(indirect_ref_int$collectdatetime)
+indirect_ref_int$sex <- as.factor(indirect_ref_int$sex)
+
+#This is not needed for this data set but I always perform this. Any non-numeric data will be converted to NA
+indirect_ref_int$result <- as.numeric(indirect_ref_int$result)
+
+#confirm datatype changes
+glimpse(indirect_ref_int)
+```
+```{r data_cleanup}
+### Data cleanup is consistent enough with my usual 
+### data sets that I use a function for this.
+### 
+# When working with indirect reference intervals, 
+# I remove unknown sexes.
+indirect_ref_int <- filter(indirect_ref_int, sex != "U")
+
+#Here I drop any NAs created in the results and DOB columns. 
+#Before moving to the next calculation
+indirect_ref_int <- indirect_ref_int %>% 
+  drop_na(birthdate_odbc) %>%
+  drop_na(result)
+
+# I have found that age in days is easier to work with than months or years 
+# for indirect reference intervals. This calculation uses
+# age_calc from the eeptools package
+indirect_ref_int$age_d <-
+  if_else(
+  as_date(indirect_ref_int[['collectdatetime']]) > 
+    as_date(indirect_ref_int[['birthdate_odbc']]),
+  eeptools::age_calc(
+  dob = as_date(indirect_ref_int[['birthdate_odbc']]),
+  enddate = as_date(indirect_ref_int[['collectdatetime']]),
+  units = "days"
+  ),
+  0
+  )
+
+#To use only the outpatient data, we filter using Regex (stringr package). 
+indirect_ref_int <- indirect_ref_int %>% dplyr::filter(stringr::str_detect(loc_code, "^OP")  )
+
+#Typically, there are multiple locations to filter. A function is easier to use. 
+#Here is an example of a function that I work with almost daily.
+#
+# data.filter <- function(x) {
+#   x %>%
+#   filter(
+#   !loc_name %in% c(
+#   "location1",
+#   "location2",
+#   "location3"
+#   )
+#   )
+# }
+
+###
+###
+demographic_info <- as.data.frame(summary(indirect_ref_int))
+min(indirect_ref_int$age_d)
+max(indirect_ref_int$age_d)
+mean(indirect_ref_int$age_d)
+median(indirect_ref_int$age_d)
+```
+```{r data_partition}
+###Partition creation can be done here if you know what type of partition or 
+###you know what you are trying to test
+indirect_ref_int_list <- list(
+  ### No partitions needed.
+"Analyte1" = indirect_ref_int %>% 
+    filter(test_code == "Analyte1") %>%
+    dplyr::select(result),
+### Sex groupings only
+"Analyte2_female" = indirect_ref_int %>%
+    filter(test_code == "Analyte2" & sex == "F") %>%
+    dplyr::select(result),
+"Analyte2_male" = indirect_ref_int %>% 
+    filter(test_code == "Analyte2" & sex == "M") %>% 
+    dplyr::select(result),
+### Three age groups <=2 yr, 2-10 yr, and >10 yr
+"Analyte3_731d" = indirect_ref_int %>% 
+    filter(test_code == "Analyte3" & age_d <= 731) %>% 
+    dplyr::select(result),
+"Analyte3_731-3653d" = indirect_ref_int %>% 
+    filter(test_code == "Analyte3" & age_d > 731 & age_d <= 3653) %>% 
+    dplyr::select(result),
+"Analyte3_3653d" = indirect_ref_int %>% 
+    filter(test_code == "Analyte3" & age_d > 3653) %>% 
+    dplyr::select(result),
+### Sex and age groups <=6 m and >6 m
+"Analyte4_lte183d_male" = indirect_ref_int %>% 
+    filter(test_code == "Analyte4" & age_d <= 183 & sex == "M") %>% 
+    dplyr::select(result),
+"Analyte4_gt183d_male" = indirect_ref_int %>% 
+    filter(test_code == "Analyte4" & age_d > 183 & sex == "M") %>% 
+    dplyr::select(result),
+"Analyte4_lte183d_female" = indirect_ref_int %>% 
+  filter(test_code == "Analyte4" & age_d <= 183 & sex == "F") %>% 
+  dplyr::select(result),
+"Analyte4_gt183d_female" = indirect_ref_int %>% 
+  filter(test_code == "Analyte4" & age_d > 183 & sex == "F") %>% 
+  dplyr::select(result)
+)
+
+```
+```{r data_transformation_outlier_removal}
+### data.test is a function that uses the fitdistrplus package.
+### For documentation purposes I produce the histograms and Cullen & Frey graphs
+### I save the stats for the analytes pre and post outlier removal & transformation.
+indirect_ref_int_stats_pre <- indirect_ref_int_list %>% 
+  map_depth(data.test, .depth = 2)
+csv.out(unlist(unlist(indirect_ref_int_stats_pre, recursive = F), recursive = F), "Pre_Transformation_Stats_")
+
+indirect_ref_int_list_trans <- indirect_ref_int_list %>% 
+  map_depth(data.tran, .depth = 2)
+indirect_ref_int_list_tran1 <- lapply(indirect_ref_int_list_trans, '[', 1)
+indirect_ref_int_list_tran1 <- unlist(indirect_ref_int_list_tran1, recursive = F)
+
+# Extract the transformed data
+indirect_ref_int_list_tran <- lapply(indirect_ref_int_list_trans, '[[', 1)
+indirect_ref_int_list_tran <- lapply(indirect_ref_int_list_tran, '[', 1)
+
+
+# Remove outliers using the remove.outlier function which uses the Tukey Method from transformed data
+nontransformed_outliers <- indirect_ref_int_list %>%
+  map_depth(remove.outlier, .depth = 2)
+sample_number_after_nontrans <- map(map(unlist(nontransformed_outliers, recursive = F), na.omit), length)
+sample_number_after_nont <- map(map(unlist(indirect_ref_int_list, recursive = F), na.omit), length)
+
+
+# Remove outliers using the remove.outlier function which uses the Tukey Method from transformed data
+indirect_ref_int_list_out <- indirect_ref_int_list_tran %>%
+  map_depth(remove.outlier, .depth = 2)
+
+# I record the number of samples removed through the Tukey Method
+sample_number_before <- map(unlist(indirect_ref_int_list, recursive = F), length)
+sample_number_after <- map(map(unlist(indirect_ref_int_list_out, recursive = F), na.omit), length)
+Pre_Post_Outlier_Sample_numbers <- data.frame("analyte_names" = names(indirect_ref_int_list))
+Pre_Post_Outlier_Sample_numbers$outrem_notrans <- as.numeric(sample_number_before)
+Pre_Post_Outlier_Sample_numbers[["Post Transformation and Outliers Removed (n)"]] <- as.numeric( sample_number_after )
+Pre_Post_Outlier_Sample_numbers$post_notrans <- as.numeric(sample_number_after_nontrans)
+Pre_Post_Outlier_Sample_numbers[["Post Transformation Outliers Removed"]] <- 
+  as.numeric(Pre_Post_Outlier_Sample_numbers$outrem_notrans)-as.numeric(Pre_Post_Outlier_Sample_numbers$post)
+Pre_Post_Outlier_Sample_numbers[["Post Transformation Percent"]] <-
+  (as.numeric(Pre_Post_Outlier_Sample_numbers[["Post Transformation Outliers Removed"]])/as.numeric(Pre_Post_Outlier_Sample_numbers$outrem_notrans))*100
+Pre_Post_Outlier_Sample_numbers[["No Transformation Outliers Removed"]] <- 
+  as.numeric(Pre_Post_Outlier_Sample_numbers$outrem_notrans)-as.numeric(Pre_Post_Outlier_Sample_numbers$post_notrans)
+Pre_Post_Outlier_Sample_numbers[["No Transformation Percent"]] <-
+  (as.numeric(Pre_Post_Outlier_Sample_numbers[["No Transformation Outliers Removed"]])/as.numeric(Pre_Post_Outlier_Sample_numbers$outrem_notrans))*100
+
+
+indirect_ref_int_stats_post <- 
+  map(unlist(indirect_ref_int_list_out, recursive = F), data.test)
+csv.out(unlist(indirect_ref_int_stats_post, recursive = F), "Post_Transformation_Stats_")
+csv.out(as.data.frame(Pre_Post_Outlier_Sample_numbers),  "Outlier_removal_")
+glimpse(Pre_Post_Outlier_Sample_numbers)
+
+```
+```{r data_reference_interval_determination}
+
+### I do a bootstrap analysis using resample from the mosaic package which is set by the 
+### n. To speed up the process I have included the capture.output and invisible which
+### helps when running n = 100. Mixtool.drb is a function that just standardizes the
+### the mixtool parameters. Mixtool.limits determines the reference limits based on 
+### the mixtool results.
+
+n <- 100
+indirect_ref_list_ml <- list()
+analyte_name <- names(indirect_ref_int_list_out)
+indirect_ref_int_list_out <- unlist(indirect_ref_int_list_out, recursive = F)
+
+for(m in 1:length(indirect_ref_int_list_out)) {
+  h <- na.omit(as.numeric(indirect_ref_int_list_out[[m]]))
+ 
+   for (i in 1:n) {
+ invisible(
+   capture.output(
+  indirect_ref_list_ml[[analyte_name[[m]]]][[i]] <- 
+ mixtool.limits(mixtool.drb(as.numeric(h)))
+)
+)
+  }
+}
+
+
+
+indirect_ref_int_estimates <- list()
+for(i in 1:length(indirect_ref_list_ml)){
+indirect_ref_int_estimates[[analyte_name[[i]]]] <- 
+  backtransform2(indirect_ref_list_ml[[i]], indirect_ref_int_list_tran1[[i]])
+
+}
+
+
+
+```
+```{r ref_int_summary} 
+
+RI_summary <- list()
+for(j in 1:length(indirect_ref_int_estimates)) {
+  ref_int_summary <- list()
+  print(analyte_name[[j]])
+  ref_int_summary[[analyte_name[[j]]]] <- list(
+  "Analyte Name" = analyte_name[[j]],
+  "n" = mean(as.numeric(indirect_ref_int_estimates[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates[[j]]$lower.limit
+  ))),
+  "Lower Limit Left CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates[[j]]$lower.limit
+  ))) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates[[j]]$lower.limit
+  ))) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+    #"Lower Limit SD" = sd(as.numeric(indirect_ref_int_estimates[[j]]$lower.limit),  na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates[[j]]$upper.limit
+  ))),
+  
+  "Upper Limit Left CI" = mean(na.omit(as.numeric(
+ indirect_ref_int_estimates[[j]]$upper.limit)
+  )) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates[[j]]$upper.limit)
+  )) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  #"Upper Limit SD" = sd(  as.numeric(indirect_ref_int_estimates[[j]]$upper.limit),  na.rm = TRUE  ),
+  "Lambda Mean" = mean(as.numeric(na.omit(indirect_ref_int_estimates[[j]]$lambda)))
+  )
+  
+  RI_summary[[analyte_name[[j]]]] <-
+  ref_int_summary[[analyte_name[[j]]]]
+}
+
+csv.out(RI_summary, "Indirect_RI_summary_")
+```
+```{r data_reference_interval_determination_nontransformed}
+
+### I do a bootstrap analysis using resample from the mosaic package which is set by the 
+### n. To speed up the process I have included the capture.output and invisible which
+### helps when running n = 100. Mixtool.drb is a function that just standardizes the
+### the mixtool parameters. Mixtool.limits determines the reference limits based on 
+### the mixtool results.
+
+
+indirect_ref_list_ml_nt <- list()
+analyte_name <- names(indirect_ref_int_list_out)
+indirect_ref_int_list_out_nt <- unlist(nontransformed_outliers, recursive = F)
+
+for(m in 1:length(indirect_ref_int_list_out_nt)) {
+  h <- na.omit(as.numeric(indirect_ref_int_list_out_nt[[m]]))
+ 
+   for (i in 1:n) {
+ invisible(
+   capture.output(
+  indirect_ref_list_ml_nt[[analyte_name[[m]]]][[i]] <- 
+ mixtool.limits(mixtool.drb(as.numeric(h)))
+)
+)
+  }
+}
+
+
+```
+```{r ref_int_summary_nt} 
+indirect_ref_int_estimates_nt <- list()
+for(i in 1:length(indirect_ref_list_ml_nt)) {
+  indirect_ref_int_estimates_nt[[analyte_name[[i]]]] <-
+  notransform(indirect_ref_list_ml_nt[[i]])
+}
+
+RI_summary_nt <- list()
+for(j in 1:length(indirect_ref_int_estimates_nt)) {
+  ref_int_summary_nt <- list()
+  print(analyte_name[[j]])
+  ref_int_summary_nt[[analyte_name[[j]]]] <- list(
+  "Analyte Names" = analyte_name[[j]],
+  "n" = mean(as.numeric(indirect_ref_int_estimates_nt[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_nt[[j]]$lower.limit
+  ))),
+  "Lower Limit Left CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_nt[[j]]$lower.limit
+  ))) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_nt[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_nt[[j]]$lower.limit
+  ))) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_nt[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  #  "Lower Limit SD" = sd(  as.numeric(indirect_ref_int_estimates_nt[[j]]$lower.limit),  na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_nt[[j]]$upper.limit
+  ))),
+  
+  "Upper Limit Left CI" = mean(na.omit(as.numeric(
+indirect_ref_int_estimates_nt[[j]]$upper.limit)
+  )) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_nt[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_nt[[j]]$upper.limit)
+  )) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_nt[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n)#,
+  #"Upper Limit SD" = sd(  as.numeric(indirect_ref_int_estimates_nt[[j]]$upper.limit),  na.rm = TRUE  ),
+  #"Lambda Mean" = mean(as.numeric(na.omit(indirect_ref_int_estimates_nt[[j]]$lambda)))
+  )
+  
+  RI_summary_nt[[analyte_name[[j]]]] <-
+  ref_int_summary_nt[[analyte_name[[j]]]]
+}
+
+csv.out(RI_summary_nt, "Indirect_RI_summary_nt_")
+```
+```{r data_reference_interval_determination_nontransformed_wo_outliers_removed}
+
+### I do a bootstrap analysis using resample from the mosaic package which is set by the 
+### n. To speed up the process I have included the capture.output and invisible which
+### helps when running n = 100. Mixtool.drb is a function that just standardizes the
+### the mixtool parameters. Mixtool.limits determines the reference limits based on 
+### the mixtool results.
+
+
+indirect_ref_list_ml_nt_or <- list()
+analyte_name_ntor <- names(indirect_ref_int_list)
+indirect_ref_int_list_ntor <- unlist(indirect_ref_int_list, recursive = F)
+
+for(m in 1:length(indirect_ref_int_list_ntor)) {
+  h <- na.omit(as.numeric(indirect_ref_int_list_ntor[[m]]))
+ 
+   for (i in 1:n) {
+ invisible(
+   capture.output(
+  indirect_ref_list_ml_nt_or[[analyte_name[[m]]]][[i]] <- 
+ mixtool.limits(mixtool.drb(as.numeric(h)))
+)
+)
+  }
+}
+
+
+```
+```{r ref_int_summary_ntor} 
+
+indirect_ref_int_estimates_ntor <- list()
+for(i in 1:length(indirect_ref_list_ml_nt_or)) {
+  indirect_ref_int_estimates_ntor[[analyte_name_ntor[[i]]]] <-
+  notransform(indirect_ref_list_ml_nt_or[[i]])
+}
+
+RI_summary_ntor <- list()
+for(j in 1:length(indirect_ref_int_estimates_ntor)) {
+  ref_int_summary_ntor <- list()
+  print(analyte_name_ntor[[j]])
+  ref_int_summary_ntor[[analyte_name_ntor[[j]]]] <- list(
+  "Analyte Names" = analyte_name_ntor[[j]],
+  "n" = mean(as.numeric(indirect_ref_int_estimates_ntor[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_ntor[[j]]$lower.limit
+  ))),
+  "Lower Limit Left CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_ntor[[j]]$lower.limit
+  ))) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_ntor[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_ntor[[j]]$lower.limit
+  ))) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_ntor[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit SD" = sd(  as.numeric(indirect_ref_int_estimates_nt[[j]]$lower.limit),  na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_ntor[[j]]$upper.limit
+  ))),
+  
+  "Upper Limit Left CI" = mean(na.omit(as.numeric(
+indirect_ref_int_estimates_ntor[[j]]$upper.limit)
+  )) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_ntor[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ref_int_estimates_ntor[[j]]$upper.limit)
+  )) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ref_int_estimates_ntor[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit SD" = sd(  as.numeric(indirect_ref_int_estimates_nt[[j]]$upper.limit),  na.rm = TRUE  ),
+  "Lambda Mean" = mean(as.numeric(na.omit(indirect_ref_int_estimates_ntor[[j]]$lambda)))
+  )
+  
+  RI_summary_ntor[[analyte_name_ntor[[j]]]] <-
+  ref_int_summary_ntor[[analyte_name_ntor[[j]]]]
+}
+
+csv.out(RI_summary_ntor, "Indirect_RI_summary_ntor_")
+```
+
