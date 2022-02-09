@@ -1,0 +1,1753 @@
+---
+title: Indirect Reference Intervals using a R Pipeline
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{multirow}
+  - \usepackage{wrapfig}
+  - \usepackage{float}
+  - \usepackage{colortbl}
+  - \usepackage{pdflscape}
+  - \usepackage{tabu}
+  - \usepackage{threeparttable}
+  - \usepackage{threeparttablex}
+  - \usepackage[normalem]{ulem}
+  - \usepackage{makecell}
+  - \usepackage{xcolor}
+classoption: x11names
+author:
+  - name: Dustin R. Bunch
+    email: dustin.bunch@nationwidechildrens.org
+    affiliation: a,b
+    footnote: 1
+address:
+  - code: a
+    address: Nationwide Children's Hospital, Department of Pathology and Laboratory Medicine, 700 Children's Dr, Columbus, OH, 43205
+  - code: b
+    address: The Ohio State University, Department of Pathology, 410 West 10th Ave, Columbus, OH, 43210
+footnote:
+  - code: 1
+    text: "Corresponding Author"
+layout: 5p
+abstract: |
+  \textbf{Background:} Indirect reference intervals require robust statistical approaches to separate the pathological and healthy values. This can be achieved with a data pipeline created in R, a freely available statistical programming language. 
+  \textbf{Methods:} A data pipeline was created to ingest, partition, normalize, remove outliers, and identify reference intervals for testosterone (Testo; n = 7,207) and aspartate aminotransferase (AST; n = 5,882) using data sets from NHANES. 
+  \textbf{Results:} The estimates for AST and Testo determined by this pipeline approximated current RIs. Care should be taken when using this pipeline as there are limitations that depend on the pathology of the analyte and the data set being used for RI estimation. 
+  \textbf{Conclusions:} R can be used to create a robust statistical reference interval  pipeline.
+keywords: |
+  Reference interval, R markdown tutorial, Mixtools
+abbreviations: |
+  ANOVA, Analysis of variance; AST, aspartate aminotransferase; CLSI, Clinical Laboratory Standards Institute; EHR, electronic health record; LC-MS/MS, liquid chromatography tandem mass spectrometry; LIS, laboratory informatics system; IFCC, International Federation of Clinical Chemistry and Laboratory Medicine; RI, reference interval; SDI, standard deviation index; SDR, standard deviation ratio; Testo, testosterone; TukeyHSD, Tukey multiple pairwise-comparisons; z5, critical z-score
+
+journal: "Journal of Mass Spectrometry & Advances in the Clinical Lab"
+date: "`r Sys.Date()`"
+bibliography: mybibfile.bib
+#linenumbers: true
+#numbersections: true
+csl: elsevier-vancouver.csl
+output: rticles::elsevier_article
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")
+
+library(here)
+library(readxl) 
+library(janitor)
+library(bestNormalize)
+library(mixtools)
+library(fitdistrplus)
+library(mosaic)
+library(lubridate)
+library(eeptools)
+library(haven)
+library(broom)
+library(car)
+library(moments)
+library(kableExtra)
+library(webshot)
+library(magick)
+library(tidyverse)
+options(width = 30)
+```
+```{r functions, include=FALSE}
+
+anova_test <-  function(input, c1, c2) {
+
+  # Compute the analysis of variance
+   x_aov <-
+     aov(c1 ~ c2, data = input %>% filter(c1 != "NA"))
+  # Summary of the analysis
+  x_sum <- summary(x_aov)
+  
+  # Which Pair are significant
+  tk <- TukeyHSD(x_aov)
+  # Welch Test
+  x_Welch <-
+    oneway.test(c1 ~ c2, data = input %>% filter(c1 != "NA"))
+  xw_sum <- summary(x_Welch)
+  
+  
+  
+  x_levene <- leveneTest(c1 ~ c2, data = input)
+  
+  #### The ANOVA assumptions are not met so I will perform a
+  #### Kruskal-Wallis rank sum test
+  x_kruskal <- kruskal.test(c1 ~ c2, data = input)
+  
+  output_data <- list(x_aov,x_sum,tk, x_Welch, xw_sum, 
+                      x_levene, x_kruskal)
+  output_data
+}
+
+
+##### Data analysis for Gaussian distrubution with histogram, kurtosis, and skewness #####
+data.test <- function(x) {
+  if (length(x) <= 5) {
+  "N <= 5"
+  } else{
+  capture.output(fitdistrplus::plotdist(as.numeric(na.omit(x)),
+  histo = TRUE,
+  demp = TRUE), file = 'NUL')
+  capture.output(fitdistrplus::descdist(as.numeric(na.omit(x)),
+  boot = 1000), file = 'NUL')
+  }
+}
+
+##### Tukey outlier removal function #####
+remove.outlier <- function(x, na.rm = TRUE) {
+
+  ## Find 25% and 75% Quantiles 
+  quant <- quantile(
+                x, 
+                probs = c(.25, .75), 
+                na.rm = na.rm
+                )
+  
+  ## Find interquantile range and multiply it by 1.5
+  tukey <- 1.5 * IQR(
+                    x, 
+                    na.rm = na.rm
+                    )
+  
+  y <- x
+  
+  ## Replace outliers with NA
+  y[x < (quant[1] - tukey)] <- NA
+  y[x > (quant[2] + tukey)] <- NA
+  #
+  return(y)
+}
+
+##### Yeo Johnson Data Transformation #####
+data.tran <- function(x) {
+ if(is.numeric(x) == TRUE) 
+ {
+  bestNormalize::yeojohnson(x)
+ }
+}
+
+##### Mixtool function with standardized parameters #####
+mixtool.drb <- function(x) {
+  mosaic::resample(x)
+  if (inherits(res4 <-
+  try(invisible(normalmixEM(
+  na.omit(x),
+  k = 2,
+  maxit =  30000,
+  maxrestarts = 25
+  )))
+  , "try-error")) {
+  mixtool.drb(x)
+  
+  } else{
+  res4
+  }
+  
+}
+
+##### Calculate limits based on the mixtool output #####
+mixtool.limits <- function(x) {
+ 
+  if( inherits(res1 <- try(if (x[['lambda']][1] > 0.5) {
+  #find the 2.5th 97.5th percentile from the mixed model fit
+  lower.limit <- qnorm(0.025, x[['mu']][1],   x[['sigma']][1])
+  upper.limit <-
+  qnorm(0.975,
+  x[['mu']][1],
+  x[['sigma']][1])
+  lambda.fit <-
+  x[['lambda']][1]
+  } else {
+  #find the 2.5th 97.5th percentile from the mixed model fit
+  lower.limit <-
+  qnorm(0.025,
+  x[['mu']][2],
+  x[['sigma']][2])
+  upper.limit <-
+  qnorm(0.975,
+  x[['mu']][2],
+  x[['sigma']][2])
+  lambda.fit <-
+  x[['lambda']][2]
+  }), "try-error")){
+    FALSE
+  }else{
+      res1}
+  if( inherits(res2 <- try(ref.limits <- list(
+  "N" = as.numeric(sum(!is.na(x$x))),
+  "lower.limit" = as.numeric(lower.limit),
+  "upper.limit" = as.numeric(upper.limit),
+  "lambda" =  as.numeric(lambda.fit)
+  )), "try-error")){
+    FALSE
+  }else{
+      res2
+        }
+}
+
+##### Function to convert the transformed data back to original values #####
+##### x is data that is to be converted. y is from the data transformation output #####
+backtransform2 <- function(x, y) {
+
+x.new <- list() 
+  if (inherits(res <- try(for (i in 1:length(x)) {
+ 
+  x[[i]][["lower.limit"]] <-
+  predict(y,
+  x[[i]][["lower.limit"]],
+  inverse =  TRUE)
+  x[[i]][["upper.limit"]] <-
+  predict(y,
+  x[[i]][["upper.limit"]],
+  inverse =  TRUE)
+  
+  x.new[[i]] <- x[[i]]
+ 
+  })
+  , "try-error")) {
+  FALSE
+  } else{
+  res
+  }
+  
+  # crush to flat matrix
+  my_mat <- do.call(rbind, x.new)
+  my_df <- data.frame(my_mat)
+  
+}
+
+notransform <- function(x){
+  x.new <- list()
+  if (inherits(res2 <- try(for (i in 1:length(x)) {
+  
+  x[[i]][["lower.limit"]] <-  x[[i]][["lower.limit"]]
+  x[[i]][["upper.limit"]] <-  x[[i]][["upper.limit"]]
+  
+  
+  x.new[[i]] <- x[[i]]
+  
+  }), "try-error")) {
+  FALSE
+  } else{
+  res2
+  }
+  
+  # crush to flat matrix
+  mydataframe <- data.frame(do.call(rbind, x.new))
+  }
+  
+
+
+##### CSV output to results folder. x is data. y is file name. #####
+csv.out <- function(x, y){
+  write.csv(x, file = here::here("results",  paste0( y,
+format(Sys.time(), "%Y-%m-%d_%k.%M%S"),".csv" )), row.names = FALSE) 
+}
+```
+```{r data_import1, include=FALSE}
+#Data Ingestion
+lab_data <- haven::read_xpt(here::here
+                 ("data",
+                   "BIOPRO_J.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, lbxsassi)
+
+demo_data_2018 <- haven::read_xpt(here::here
+                 ("data",
+                   "DEMO_J.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, riagendr, ridageyr)
+
+etoh_data <- haven::read_xpt(here::here
+                 ("data",
+                   "ALQ_J.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, alq121)
+
+medical_data <- haven::read_xpt(here::here
+                 ("data",
+                   "MCQ_J.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, mcq170l, mcq510a, mcq510b, mcq510c, mcq510d, mcq510e, mcq510f)
+
+ast_ri <- full_join(lab_data, demo_data_2018, by = "seqn")
+ast_ri <- ast_ri %>%
+  full_join(etoh_data, by = "seqn") %>%
+  full_join(medical_data, by = "seqn")
+
+# check datatypes
+glimpse(ast_ri)
+ast_ri$riagendr <- ast_ri$riagendr %>%
+  dplyr::recode(`1` = "M", `2` = "F", .default = NA_character_) %>%
+  as.factor() 
+ast_ri$seqn <- as.character(ast_ri$seqn)
+ast_ri <- ast_ri %>%
+  drop_na(lbxsassi)
+
+n_ast <- ast_ri %>%
+  nrow()
+```
+```{r test_import1, include=FALSE}
+## Data Ingestion ##
+# read in data
+demo_data_2015 <- haven::read_xpt(here::here
+                 ("data",
+                   "DEMO_I.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, riagendr, ridageyr)
+
+testo_data <- haven::read_xpt(here::here
+                 ("data",
+                   "TST_I.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, lbxtst)
+
+# join data from two sources
+testo_ri <- full_join(testo_data, 
+                      demo_data_2015, 
+                      by = "seqn")
+testo_ri$ridageyr <- as.numeric(
+  testo_ri$ridageyr)
+
+```
+```{r test_import_21, include=FALSE}
+## Code Block 1: Data import ##
+# read in data
+demo_data_2015 <- haven::read_xpt(here::here
+                 ("data",
+                   "DEMO_I.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, riagendr, ridageyr)
+
+testo_data <- haven::read_xpt(here::here
+                 ("data",
+                   "TST_I.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, lbxtst)
+
+# join data from two sources
+testo_ri <- full_join(testo_data, 
+                      demo_data_2015, 
+                      by = "seqn")
+```
+```{r data_cleanup1, include=FALSE, fig.height=4, fig.width=3.5}
+## Code Block 2: Data Wrangling ##
+# check data types
+#glimpse(testo_ri) #Remove comment '#' to use.
+
+# adjust datatypes
+testo_ri$riagendr <- 
+  testo_ri$riagendr %>%
+  dplyr::recode(`1` = "M", `2` = "F", 
+                .default = NA_character_) %>%
+  as.factor() 
+
+testo_ri$seqn <- as.character(testo_ri$seqn)
+
+# remove NAs from results 
+testo_ri <- testo_ri %>% 
+  drop_na(lbxtst) 
+
+testo_ri <- testo_ri %>% 
+  filter(ridageyr > 17)
+
+# Remove those with known liver conditions
+ast_ri <- ast_ri %>%
+  dplyr::filter(is.na(mcq510a)) %>%
+  filter(is.na(mcq510b)) %>%
+  filter(is.na(mcq510c)) %>%
+  filter(is.na(mcq510d)) %>%
+  filter(is.na(mcq510e)) %>%
+  filter(is.na(mcq510f))
+```
+```{r ast_partition1, include = FALSE, fig.height=4, fig.width=3.5, echo=FALSE}
+# Data Partitions
+
+ast_age <- ast_ri %>%
+  dplyr::select(lbxsassi, riagendr, ridageyr) %>%
+  filter(!is.na(lbxsassi)) %>%
+  filter(!is.na(ridageyr)) 
+
+ast_anova.age <- anova_test(
+  ast_age, ast_age$lbxsassi, 
+  as.factor(ast_age$ridageyr))
+
+ast.anova.df <-  as.data.frame(
+  as.matrix(ast_anova.age[[3]]$c2))
+
+ast.anova.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+plot(ast_anova.age[[1]],2)
+```
+```{r test_denovo_partition1, include=FALSE}
+test_age <- testo_ri %>%
+  dplyr::select(lbxtst, riagendr, ridageyr) %>%
+  filter(!is.na(lbxtst)) %>%
+  filter(!is.na(ridageyr)) %>%
+  filter(!is.na(riagendr))
+
+
+#### Males ####
+test_age_m <- test_age %>%
+  filter(riagendr == "M")
+
+test_anova_m_age <- anova_test(
+  test_age_m, test_age_m$lbxtst, 
+  as.factor(test_age_m$ridageyr))
+test.anova.m.df <-  as.data.frame(
+  as.matrix(test_anova_m_age[[3]]$c2))
+
+test.anova.m.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+# Based on these results I believe there is a split
+# 19-69, 70-80. However, looking at these in
+# smaller groups 19-30, 31-80 seems to work better.
+testo_19_30 <- test_age_m %>%
+  filter(as.numeric(as.character(ridageyr)) > 18 
+         & as.numeric(as.character(ridageyr)) < 31)
+
+testo_aov_19_30 <- anova_test(
+  testo_19_30, testo_19_30$lbxtst, 
+  as.factor(testo_19_30$ridageyr))
+testo_aov_19_30.df <-  as.data.frame(
+  as.matrix(testo_aov_19_30[[3]]$c2))
+
+testo_aov_19_30.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+testo_31_80 <- test_age_m %>%
+  filter(as.numeric(as.character(ridageyr)) > 30 
+         & as.numeric(as.character(ridageyr)) < 81)
+
+testo_aov_31_80 <- anova_test(
+  testo_31_80, testo_31_80$lbxtst, 
+  as.factor(testo_31_80$ridageyr))
+testo_aov_31_80.df <-  as.data.frame(
+  as.matrix(testo_aov_31_80[[3]]$c2))
+
+testo_aov_31_80.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+#### Females ####
+
+test_age_f <- test_age %>%
+  filter(riagendr == "F")
+
+test_anova_f_age <- anova_test(
+  test_age_f, test_age_f$lbxtst, 
+  as.factor(test_age_f$ridageyr))
+test.anova.f.df <-  as.data.frame(
+  as.matrix(test_anova_f_age[[3]]$c2))
+
+test.anova.f.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+testo_f18_40 <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 17 
+         & as.numeric(as.character(ridageyr)) < 41)
+
+testo_aov_f18_40 <- anova_test(
+  testo_f18_40, testo_f18_40$lbxtst, 
+  as.factor(testo_f18_40$ridageyr))
+testo_aov_f18_40.df <-  as.data.frame(
+  as.matrix(testo_aov_f18_40[[3]]$c2))
+
+testo_aov_f18_40.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+testo_f41_80 <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 40 
+         & as.numeric(as.character(ridageyr)) < 81)
+
+testo_aov_f41_80 <- anova_test(
+  testo_f41_80, testo_f41_80$lbxtst, 
+  as.factor(testo_f41_80$ridageyr))
+testo_aov_f41_80.df <-  as.data.frame(
+  as.matrix(testo_aov_f41_80[[3]]$c2))
+
+testo_aov_f41_80.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+```
+```{r test_reference_partition1, include=FALSE}
+## Code Block 4: 
+## Partitioning with Known Ranges ##
+test_age <- testo_ri %>%
+  dplyr::select(lbxtst, riagendr, ridageyr) %>%
+  filter(!is.na(lbxtst)) %>%
+  filter(!is.na(ridageyr)) %>%
+  filter(!is.na(riagendr))
+
+#### Males ####
+test_age_m <- test_age %>%
+  filter(riagendr == "M")
+
+# Using an existing RI from a reference 
+# lab the split will be  >= 19 for males and 
+# for female >= 19.
+
+testo_19_80_r <- test_age_m %>%
+  filter(as.numeric(as.character(ridageyr)) > 18 
+      & as.numeric(as.character(ridageyr)) < 81)
+
+#### Females ####
+
+test_age_f <- test_age %>%
+  filter(riagendr == "F")
+
+testo_f19_45_r <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 18 
+      & as.numeric(as.character(ridageyr)) < 46)
+
+testo_f46_80_r <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 45 
+      & as.numeric(as.character(ridageyr)) < 81)
+
+indirect_ri_list <- list(
+# No partitions needed.
+"AST_Both_All" = ast_ri %>% 
+    dplyr::select(lbxsassi),
+"Testo_M_19-80" = testo_19_80_r%>% 
+    dplyr::select(lbxtst),
+"Testo_F_20-45" = testo_f19_45_r %>% 
+    dplyr::select(lbxtst),
+"Testo_F_45-80" = testo_f46_80_r%>% 
+    dplyr::select(lbxtst)
+)
+
+```
+```{r data_transformation1, echo=FALSE, results='hide'}
+## Code Block 5:
+## Data Transformation ##
+# data.test is a custom function that  
+# uses the fitdistrplus package. For  
+# documentation purposes I produce the    
+# histograms and Cullen & Frey graphs.  
+# Stats are saved for the analytes pre  
+# and post transformation & outlier 
+# removal.
+
+# This code automatically prints histogram,
+# qq-plot, and Cullen & Frey graph
+# indirect_ri_list %>%
+  # map_depth(data.test, .depth = 2)
+
+indirect_ri_list_trans <- 
+  indirect_ri_list %>%
+  map_depth(data.tran, .depth = 2)
+# Extract the transformed data
+indirect_ri_list_tran <-
+  lapply(indirect_ri_list_trans, 
+         '[[', 1)
+indirect_ri_list_tran <-
+  lapply(indirect_ri_list_tran, 
+         '[', 1)
+
+
+# These list are used to do the 
+# backtransformations downstream
+indirect_ri_list_tran1 <-
+  lapply(indirect_ri_list_trans, 
+         '[', 1)
+indirect_ri_list_tran1 <-
+  unlist(indirect_ri_list_tran1, 
+         recursive = F)
+
+# This code automatically prints histogram,
+# qq-plot, and Cullen & Frey graph
+#  map(map(indirect_ri_list_tran1, "x.t"), data.test)
+```
+```{r outlier_removal1, include=FALSE}
+## Code Block 6: 
+## Outlier detection and removal ##
+# Remove outliers using the custom    
+# remove.outlier function which uses  
+# the Tukey Method.
+indirect_ri_list_out <- 
+  indirect_ri_list_tran %>%
+  map_depth(remove.outlier, .depth = 2)
+```
+```{r outlier_removal_cont1, include=FALSE}
+# Remove outliers using the remove.outlier   
+# function which uses the Tukey Method from 
+# transformed data 
+
+nontransformed_outliers <- 
+  indirect_ri_list %>%
+  map_depth(remove.outlier, .depth = 2)
+sample_number_after_nontrans <-
+  map(map(unlist(nontransformed_outliers, 
+                 recursive = F), 
+          na.omit), length)
+sample_number_after_nont <-
+  map(map(unlist(indirect_ri_list, 
+                 recursive = F), 
+          na.omit), length)
+
+# I record the number of samples removed 
+# through the Tukey Method
+sample_number_before <-
+  map(unlist(indirect_ri_list, 
+             recursive = F), length)
+sample_number_after <-
+  map(map(unlist(indirect_ri_list_out, 
+                 recursive = F), 
+          na.omit), length)
+```
+```{r data_reference_interval_determination1, include=FALSE, results='hide', cache=TRUE}
+## Code Block 7:
+## Reference Interval Estimation ##
+# The estimation is bootstrapped "n" times 
+# using resample from the mosaic package
+# To speed up the process, capture.output 
+# and invisible are included which helps  
+# when running n = 500. Mixtool.drb is a  
+# custom function that standardizes the   
+# mixtool parameters and allows mapping   
+# of the list. Mixtool.limits estimates 
+# the reference limits using the mixtool 
+# results.
+
+n <- 500
+
+analyte_name <- names(indirect_ri_list_out)
+
+indirect_ri_list_out <- 
+  unlist(indirect_ri_list_out, 
+         recursive = F)
+
+indirect_ref_list_ml <- map(1:n, 
+  ~ map(map(map(indirect_ri_list_out, 
+                na.omit), mixtool.drb), mixtool.limits))
+
+indirect_ref_list_ml <- 
+  transpose(indirect_ref_list_ml)
+indirect_ref_list_ml <- 
+  modify_depth(indirect_ref_list_ml, 1, transpose)
+
+```
+```{r RI_conversion1, include=FALSE, echo=FALSE, results='hide'}
+indirect_ri_list_trans <- 
+  unlist(indirect_ri_list_trans, 
+         recursive = F)
+
+RI_summary <- list()
+for(j in 1:length(indirect_ref_list_ml)) {
+  ref_int_summary <- list()
+
+  ref_int_summary[[analyte_name[[j]]]] <- list(
+  "Analyte Names" = analyte_name[[j]],
+  "n" = mean(as.numeric(indirect_ref_list_ml[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$lower.limit), inverse = T)  )),
+  "Lower Limit Left CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$lower.limit), inverse = T)  )) - qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$lower.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$lower.limit), inverse = T)  )) + qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$lower.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit SD" = sd(  
+    predict(indirect_ri_list_trans[[j]], as.numeric(
+      indirect_ref_list_ml[[j]]$lower.limit), inverse = T),  
+    na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$upper.limit), inverse = T)  )),
+  
+  "Upper Limit Left CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+indirect_ref_list_ml[[j]]$upper.limit), inverse = T)  )) - qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$upper.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$upper.limit), inverse = T)  )) + qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$upper.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit SD" = sd(
+    predict(indirect_ri_list_trans[[j]], as.numeric(
+      indirect_ref_list_ml[[j]]$upper.limit), inverse = T),  
+    na.rm = TRUE  ),
+  "Lambda Mean" = mean(
+    as.numeric(
+      na.omit(indirect_ref_list_ml[[j]]$lambda)))
+  )
+  
+  RI_summary[[analyte_name[[j]]]] <-
+  ref_int_summary[[analyte_name[[j]]]]
+}
+
+csv.out(RI_summary, "Indirect_RI_summary")
+
+```
+```{r table1_prep1, echo=FALSE}
+# Before and After Transformation
+
+n_values <- data.frame("analyte.group" = rlist::list.names(indirect_ri_list_tran1))
+n_values$analyte.group <-str_replace(n_values$analyte.group, "\\.", "_")
+n_values$Analyte <- word(n_values$analyte.group, 1, sep = "_")
+n_values$Gender <- word(n_values$analyte.group, 2, sep = "_")
+n_values$`Age Range (yr)` <- word(n_values$analyte.group, 3, sep = "_")
+n_values$n <- map(indirect_ri_list_tran1[1:4], "n" )
+n_values$Min <- map(map(indirect_ri_list_tran1[1:4], "x" ), min)
+n_values$Max <- map(map(indirect_ri_list_tran1[1:4], "x" ), max)
+n_values$Mean <- map(map(map(indirect_ri_list_tran1[1:4], "x" ), mean),round, 1)
+n_values$SD <- map(map(map(indirect_ri_list_tran1[1:4], "x" ), sd), round ,1)
+n_values$Skewness <- map(map(map(indirect_ri_list_tran1[1:4], "x" ), skewness), round ,1)
+n_values$Kurtosis <- map(map(map(indirect_ri_list_tran1[1:4], "x" ), kurtosis), round ,1)
+n_values$`Outliers (%)` <- str_c(as.numeric(sample_number_before)-as.numeric(sample_number_after_nontrans), " (", round((as.numeric(sample_number_before)-as.numeric(sample_number_after_nontrans))/as.numeric(n_values$n)*100, 1), ")")
+n_values$`Min ` <- map(map(map(indirect_ri_list_tran1[1:4], "x.t" ), min), round, 1)
+n_values$`Max `<- map(map(map(indirect_ri_list_tran1[1:4], "x.t" ), max), round, 1)
+n_values$`Mean ` <- map(map(map(indirect_ri_list_tran1[1:4], "x.t" ), mean),round, 1)
+n_values$`SD ` <- map(map(map(indirect_ri_list_tran1[1:4], "x.t" ), sd), round ,1)
+n_values$`Skewness ` <- map(map(map(indirect_ri_list_tran1[1:4], "x.t" ), skewness), round ,1)
+n_values$`Kurtosis ` <- map(map(map(indirect_ri_list_tran1[1:4], "x.t" ), kurtosis), round ,1)
+n_values$`Outliers (%) ` <- str_c(as.numeric(sample_number_before)-as.numeric(sample_number_after), " (", round((as.numeric(sample_number_before)-as.numeric(sample_number_after))/as.numeric(n_values$n)*100, 1), ")")
+n_values<- n_values %>%
+  dplyr::select(-analyte.group)
+```
+```{r table2_prep1, include = FALSE, echo=FALSE, results='hide', cache =T}
+indirect_ref_list_ml_nt <- list()
+nontransformed_outliers <- 
+  unlist(nontransformed_outliers, 
+         recursive = F)
+
+for(m in 1:length(nontransformed_outliers)) {
+  h <- na.omit(as.numeric(
+    nontransformed_outliers[[m]]
+    ))
+ 
+   for (i in 1:n) {
+ invisible(
+   capture.output(
+  indirect_ref_list_ml_nt[[
+    analyte_name[[m]]]][[i]] <- 
+ mixtool.limits(mixtool.drb(as.numeric(h)))
+)
+)
+  }
+}
+
+indirect_ri_estimates_nt <- list()
+for(i in 1:length(indirect_ref_list_ml_nt)){
+indirect_ri_estimates_nt[[
+  analyte_name[[i]]]] <- 
+  # crush to flat matrix
+  data.frame(do.call(rbind, indirect_ref_list_ml_nt[[i]]))
+
+}
+
+RI_summary_nt <- list()
+for(j in 1:length(indirect_ri_estimates_nt)) {
+  ref_int_summary <- list()
+  print(analyte_name[[j]])
+  ref_int_summary[[analyte_name[[j]]]] <- list(
+  "Analyte Names" = analyte_name[[j]],
+  "n" = mean(as.numeric(indirect_ri_estimates_nt[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ri_estimates_nt[[j]]$lower.limit
+  ))),
+  "Lower Limit Left CI" = mean(na.omit(as.numeric(
+  indirect_ri_estimates_nt[[j]]$lower.limit
+  ))) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ri_estimates_nt[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ri_estimates_nt[[j]]$lower.limit
+  ))) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ri_estimates_nt[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit SD" = sd(  
+    as.numeric(
+      indirect_ri_estimates_nt[[j]]$lower.limit),  
+    na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(as.numeric(
+  indirect_ri_estimates_nt[[j]]$upper.limit
+  ))),
+  
+  "Upper Limit Left CI" = mean(na.omit(as.numeric(
+indirect_ri_estimates_nt[[j]]$upper.limit)
+  )) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ri_estimates_nt[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(as.numeric(
+  indirect_ri_estimates_nt[[j]]$upper.limit)
+  )) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(indirect_ri_estimates_nt[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit SD" = sd(
+    as.numeric(
+      indirect_ri_estimates_nt[[j]]$upper.limit),  
+    na.rm = TRUE  ),
+  "Lambda Mean" = mean(
+    as.numeric(
+      na.omit(indirect_ri_estimates_nt[[j]]$lambda)))
+  )
+  
+  RI_summary_nt[[analyte_name[[j]]]] <-
+  ref_int_summary[[analyte_name[[j]]]]
+}
+
+csv.out(RI_summary_nt, "Indirect_RI_summary_nt")
+#################################################
+
+
+
+no_transform_no_outliers <-  map(1:n, 
+  ~ map(map(map(map(indirect_ri_list_tran1[1:4], "x"), 
+                na.omit), mixtool.drb), mixtool.limits))
+
+transform_no_outliers <-  map(1:n, 
+  ~ map(map(map(map(indirect_ri_list_tran1[1:4], "x.t"), 
+                na.omit), mixtool.drb), mixtool.limits))
+
+
+no_transform_no_outliers <- 
+  transpose(no_transform_no_outliers)
+no_transform_no_outliers <- 
+  modify_depth(no_transform_no_outliers, 1, transpose)
+
+transform_no_outliers <- 
+  transpose(transform_no_outliers)
+transform_no_outliers <- 
+  modify_depth(transform_no_outliers, 1, transpose)
+
+
+
+RI_summary_tno <- list()
+for(j in 1:length(transform_no_outliers)) {
+  ref_int_summary <- list()
+
+  ref_int_summary[[analyte_name[[j]]]] <- list(
+  "Analyte Names" = analyte_name[[j]],
+  "n" = mean(as.numeric(transform_no_outliers[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(
+  predict(indirect_ri_list_tran1[[j]], as.numeric(transform_no_outliers[[j]]$lower.limit), inverse = T)  )),
+  "Lower Limit Left CI" = mean(na.omit(predict(indirect_ri_list_tran1[[j]], as.numeric(
+  transform_no_outliers[[j]]$lower.limit), inverse = T)  )) - qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_tran1[[j]], as.numeric(transform_no_outliers[[j]]$lower.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(predict(indirect_ri_list_tran1[[j]], as.numeric(
+  transform_no_outliers[[j]]$lower.limit), inverse = T)  )) + qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_tran1[[j]], as.numeric(transform_no_outliers[[j]]$lower.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit SD" = sd(  
+    predict(indirect_ri_list_tran1[[j]], as.numeric(
+      transform_no_outliers[[j]]$lower.limit), inverse = T),  
+    na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(predict(indirect_ri_list_tran1[[j]], as.numeric(
+  transform_no_outliers[[j]]$upper.limit), inverse = T)  )),
+  
+  "Upper Limit Left CI" = mean(na.omit(predict(indirect_ri_list_tran1[[j]], as.numeric(
+transform_no_outliers[[j]]$upper.limit), inverse = T)  )) - qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_tran1[[j]], as.numeric(transform_no_outliers[[j]]$upper.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(predict(indirect_ri_list_tran1[[j]], as.numeric(
+  transform_no_outliers[[j]]$upper.limit), inverse = T)  )) + qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_tran1[[j]], as.numeric(transform_no_outliers[[j]]$upper.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit SD" = sd(
+    predict(indirect_ri_list_tran1[[j]], as.numeric(
+      transform_no_outliers[[j]]$upper.limit), inverse = T),  
+    na.rm = TRUE  ),
+  "Lambda Mean" = mean(
+    as.numeric(
+      na.omit(transform_no_outliers[[j]]$lambda)))
+  )
+  
+  RI_summary_tno[[analyte_name[[j]]]] <-
+  ref_int_summary[[analyte_name[[j]]]]
+}
+csv.out(RI_summary_tno, "Indirect_RI_summary_tno")
+
+
+RI_summary_ntno <- list()
+for(j in 1:length(no_transform_no_outliers)) {
+  ref_int_summary <- list()
+
+  ref_int_summary[[analyte_name[[j]]]] <- list(
+  "Analyte Names" = analyte_name[[j]],
+  "n" = mean(as.numeric(no_transform_no_outliers[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(as.numeric(
+  no_transform_no_outliers[[j]]$lower.limit
+  ))),
+  "Lower Limit Left CI" = mean(na.omit(as.numeric(
+  no_transform_no_outliers[[j]]$lower.limit
+  ))) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(no_transform_no_outliers[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(as.numeric(
+  no_transform_no_outliers[[j]]$lower.limit
+  ))) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(no_transform_no_outliers[[j]]$lower.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit SD" = sd(  
+    as.numeric(
+      no_transform_no_outliers[[j]]$lower.limit),  
+    na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(as.numeric(
+  no_transform_no_outliers[[j]]$upper.limit
+  ))),
+  
+  "Upper Limit Left CI" = mean(na.omit(as.numeric(
+no_transform_no_outliers[[j]]$upper.limit)
+  )) - qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(no_transform_no_outliers[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(as.numeric(
+  no_transform_no_outliers[[j]]$upper.limit)
+  )) + qt(0.975, df =
+  n - 1) * sd(
+  as.numeric(no_transform_no_outliers[[j]]$upper.limit),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit SD" = sd(
+    as.numeric(
+      no_transform_no_outliers[[j]]$upper.limit),  
+    na.rm = TRUE  ),
+  "Lambda Mean" = mean(
+    as.numeric(
+      na.omit(no_transform_no_outliers[[j]]$lambda)))
+  )
+  
+  RI_summary_ntno[[analyte_name[[j]]]] <-
+  ref_int_summary[[analyte_name[[j]]]]
+}
+csv.out(RI_summary_ntno, "Indirect_RI_summary_ntno")
+
+ref_int_table <- n_values %>%
+  dplyr::select(!Min:`Outliers (%) `)
+ref_int_table$`Reference Lab RI LL` <- c(10,264,10,7 )
+ref_int_table$`Reference Lab RI UL` <- c(35,916,55,40 )
+ref_int_table$`LL Mean (95% CI)` <- str_c(map(map(RI_summary[1:4], "Lower Limit Mean" ),round, 1), " (",  map(map(RI_summary[1:4], "Lower Limit Left CI" ),round,1), "-", map(map(RI_summary[1:4], "Lower Limit Right CI" ),round,1),")")
+ref_int_table$`UL Mean (95% CI)` <-  str_c(map(map(RI_summary[1:4], "Upper Limit Mean" ),round, 1), " (",  map(map(RI_summary[1:4], "Upper Limit Left CI" ),round, 1), "-", map(map(RI_summary[1:4], "Upper Limit Right CI" ),round, 1),")")
+ref_int_table$`LL Mean  (95% CI)` <- str_c(map(map(RI_summary_tno[1:4], "Lower Limit Mean" ),round, 1), " (",  map(map(RI_summary_tno[1:4], "Lower Limit Left CI" ),round,1), "-", map(map(RI_summary_tno[1:4], "Lower Limit Right CI" ),round,1),")")
+ref_int_table$`UL Mean  (95% CI)` <-  str_c(map(map(RI_summary_tno[1:4], "Upper Limit Mean" ),round, 1), " (",  map(map(RI_summary_tno[1:4], "Upper Limit Left CI" ),round, 1), "-", map(map(RI_summary_tno[1:4], "Upper Limit Right CI" ),round, 1),")")
+ref_int_table$`LL Mean (95% CI) ` <- str_c(map(map(RI_summary_nt[1:4], "Lower Limit Mean" ),round, 1), " (",  map(map(RI_summary_nt[1:4], "Lower Limit Left CI" ),round,1), "-", map(map(RI_summary_nt[1:4], "Lower Limit Right CI" ),round,1),")")
+ref_int_table$`UL Mean (95% CI) ` <-  str_c(map(map(RI_summary_nt[1:4], "Upper Limit Mean" ),round, 1), " (",  map(map(RI_summary_nt[1:4], "Upper Limit Left CI" ),round, 1), "-", map(map(RI_summary_nt[1:4], "Upper Limit Right CI" ),round, 1),")")
+ref_int_table$`LL  Mean (95% CI)` <- str_c(map(map(RI_summary_ntno[1:4], "Lower Limit Mean" ),round, 1), " (",  map(map(RI_summary_ntno[1:4], "Lower Limit Left CI" ),round,1), "-", map(map(RI_summary_ntno[1:4], "Lower Limit Right CI" ),round,1),")")
+ref_int_table$`UL  Mean (95% CI)` <-  str_c(map(map(RI_summary_ntno[1:4], "Upper Limit Mean" ),round, 1), " (",  map(map(RI_summary_ntno[1:4], "Upper Limit Left CI" ),round, 1), "-", map(map(RI_summary_ntno[1:4], "Upper Limit Right CI" ),round, 1),")")
+
+ref_int_table2 <- ref_int_table %>%
+  dplyr::select(-"n")
+```
+```{r table3_prep1, include=FALSE}
+ref_int_hb_table <- ref_int_table
+
+ref_int_hb_table <- ref_int_hb_table %>%
+  mutate(
+    "Reference Lab RI Mean" = (`Reference Lab RI UL` - `Reference Lab RI LL`) /
+      2 + `Reference Lab RI LL`,
+    "Reference Lab RI SD" = round((`Reference Lab RI UL` - `Reference Lab RI LL`) /
+                                    4, 1)
+  ) %>%
+  dplyr::select(-c(5:14))
+
+#Transformed outliers removed
+ref_int_hb_table$'Mean' <-
+  map(map2(map(
+    map(RI_summary[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 2 + .x), round, 1)
+
+ref_int_hb_table$'SD' <-
+  map(map2(map(
+    map(RI_summary[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 4), round, 1)
+ref_int_hb_table <- ref_int_hb_table %>%
+  mutate("z" = round(abs(`Reference Lab RI Mean` - as.numeric(Mean)) / sqrt(
+    (`Reference Lab RI SD` ^ 2 / as.numeric(n))  + (as.numeric(SD) ^ 2 / as.numeric(n))
+  ), 1), "z5" = round(5 * sqrt((as.numeric(    n  ) / 120)),  1)) %>%
+  mutate("SDR" = round(
+    ifelse(
+      `Reference Lab RI SD` > as.numeric(SD),
+      `Reference Lab RI SD` / as.numeric(SD),
+      as.numeric(SD) / `Reference Lab RI SD`
+    ),
+    2
+  ),
+  "SDI" = round(abs(`Reference Lab RI Mean` - as.numeric(Mean)) / `Reference Lab RI SD`, 1))
+
+#Transformed no outliers removed
+ref_int_hb_table$'Mean ' <-
+  map(map2(map(
+    map(RI_summary_tno[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary_tno[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 2 + .x), round, 1)
+
+ref_int_hb_table$'SD ' <-
+  map(map2(map(
+    map(RI_summary_tno[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary_tno[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 4), round, 1)
+ref_int_hb_table$'tno_n' <- map(RI_summary_tno[1:4], "n")
+
+ref_int_hb_table <- ref_int_hb_table %>%
+  mutate("z " = round(abs(
+    `Reference Lab RI Mean` - as.numeric(`Mean `)
+  ) / sqrt(
+    (`Reference Lab RI SD` ^ 2 / as.numeric(tno_n))  + (as.numeric(`SD `) ^
+                                                          2 / as.numeric(tno_n))
+  ), 1), "z5 " = round(5 * sqrt((
+    as.numeric(tno_n) / 120
+  )),  1)) %>%
+  mutate("SDR " = round(
+    ifelse(
+      `Reference Lab RI SD` > as.numeric(`SD `),
+      `Reference Lab RI SD` / as.numeric(`SD `),
+      as.numeric(`SD `) / `Reference Lab RI SD`
+    ),
+    2
+  ),
+  "SDI " = round(abs(
+    `Reference Lab RI Mean` - as.numeric(`Mean `)
+  ) / `Reference Lab RI SD`, 1))
+
+#Not transformed outliers removed
+ref_int_hb_table$' Mean' <-
+  map(map2(map(
+    map(RI_summary_nt[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary_nt[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 2 + .x), round, 1)
+
+ref_int_hb_table$' SD' <-
+  map(map2(map(
+    map(RI_summary_nt[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary_nt[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 4), round, 1)
+ref_int_hb_table$'nt_n' <- map(RI_summary_nt[1:4], "n")
+
+ref_int_hb_table <- ref_int_hb_table %>%
+  mutate(" z" = round(abs(
+    `Reference Lab RI Mean` - as.numeric(` Mean`)
+  ) / sqrt(
+    (`Reference Lab RI SD` ^ 2 / as.numeric(nt_n))  + (as.numeric(` SD`) ^ 2 /
+                                                         as.numeric(nt_n))
+  ), 1), " z5" = round(5 * sqrt((
+    as.numeric(nt_n) / 120
+  )),  1)) %>%
+  mutate(" SDR" = round(
+    ifelse(
+      `Reference Lab RI SD` > as.numeric(` SD`),
+      `Reference Lab RI SD` / as.numeric(` SD`),
+      as.numeric(` SD`) / `Reference Lab RI SD`
+    ),
+    2
+  ),
+  " SDI" = round(abs(
+    `Reference Lab RI Mean` - as.numeric(` Mean`)
+  ) / `Reference Lab RI SD`, 1))
+
+#Not transformed no outliers removed
+ref_int_hb_table$' Mean ' <-
+  map(map2(map(
+    map(RI_summary_ntno[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary_ntno[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 2 + .x), round, 1)
+
+ref_int_hb_table$' SD ' <-
+  map(map2(map(
+    map(RI_summary_ntno[1:4], "Lower Limit Mean"), round, 1
+  ), map(
+    map(RI_summary_ntno[1:4], "Upper Limit Mean"), round, 1
+  ), ~ (.y - .x) / 4), round, 1)
+ref_int_hb_table$'ntno_n' <- map(RI_summary_ntno[1:4], "n")
+
+
+ref_int_hb_table <- ref_int_hb_table %>%
+  mutate(" z " = round(abs(
+    `Reference Lab RI Mean` - as.numeric(` Mean `)
+  ) / sqrt(
+    (`Reference Lab RI SD` ^ 2 / as.numeric(ntno_n))  + (as.numeric(` SD `) ^
+                                                           2 / as.numeric(ntno_n))
+  ), 1), " z5 " = round(5 * sqrt((
+    as.numeric(ntno_n) / 120
+  )),  1)) %>%
+  mutate(" SDR " = round(
+    ifelse(
+      `Reference Lab RI SD` > as.numeric(` SD `),
+      `Reference Lab RI SD` / as.numeric(` SD `),
+      as.numeric(` SD `) / `Reference Lab RI SD`
+    ),
+    2
+  ),
+  " SDI " = round(abs(
+    `Reference Lab RI Mean` - as.numeric(` Mean `)
+  ) / `Reference Lab RI SD`, 1))
+
+ref_int_hb_table <- ref_int_hb_table %>%
+  dplyr::select(-c(n, ntno_n, tno_n, nt_n))
+
+```
+
+# Introduction
+
+Reference intervals (RI) are an integral component of the clinical service that a laboratory offers. For many analytes, this is the only interpretative information given with a patients’ result. The clinical laboratory is charged with determining RIs that are specific to the population served and to the specific assay in use. Several organizations give guidance including the Clinical Laboratory Standards Institute described methodologies to determine RIs (CLSI C28-A3c) [@RN38]. The direct method is performed using a “healthy” patient population either prospectively recruited or through banked and/or residual patient samples. The health status is confirmed by direct questionnaires in the case of prospective recruitment and/or through chart review. The second methodology is termed indirect because it employs  patient information from a database to determine RI. A comparison of the pros and cons of the direct and indirect methods are available in Jones et al. [@RN223]. However, this publication will focus on creating a pipeline for indirect RI determination.
+Indirect RI determinations typically use data sets from laboratory informatics system (LIS) or the electronic health record (EHR). These sources inherently contain data intermixed with pathological and normal values. To address this, indirect methods require robust statistical methods to separate the normal from the pathological results. These robust statistical methods can be achieved through consultation of biostatisticians, specialized statistical software, and/or statistical programming languages, such as R [@RN2; @RN227].  
+R is an extremely flexible statistical programming language for creating reports and for statistical packages that allow for the extension of the base language [@aqaa165; @RN12]. These packages allow the end-user to focus on the application of complex statistically approaches without requiring them to code the statistical concept themselves. In addition, many packages have extensive documentation with online tutorials. R can be used to create data pipeline for routine and *ad hoc* analysis of data. The typical statistical procedures required to determine RI described in Ichihara and Boyd’s International Federation of Clinical Chemistry and Laboratory Medicine (IFCC) recommendations [@RN222] are easily employed by a R data pipeline.  Herein, is described a R based simplified data pipeline for verification of RIs with the underlying code supplied for the user. 
+
+# Methods
+
+An R data pipline requires many statistical packages. The following packages are the critical to the piplines workflow (tidyverse [@RN228], mixtools [@RN215], janitor [@RN229], here [@RN231], readxl , fitdistrplus [@RN233], mosaic [@RN234], lubridate [@RN235], eeptools [@RN236], haven [@haven], and bestNormalize [@RN220]) were used to create a RI determination pipeline (Figure 1).  
+A subset of the 2017-2018 NHANES will be used for demonstration purposes [@NHANES]. The following files will be used demographics (DEMO_J.XPT), standard biochemistry profile (BIOPRO_J.XPT), alcohol use (ALQ_J.XPT), and medical conditions (MCQ_J.XPT). Each data set comes with documentation available at <https://wwwn.cdc.gov/nchs/nhanes/>. A second data set was extracted from the 2015-2016 NHANES for sex steroid hormones (TST_I.XPT) and the data demographics (DEMO_I.XPT) to demonstrate a sex separation.  
+The full code for this tutorial is available at <https://github.com//dustinrbunch//jmsacl_reference_interval> and includes the custom functions used for this tutorial.
+
+## Importing Data
+
+During data import column names are standardized using the janitor package. The standardization removes special characters (e.g %,+,-) that are important to the R language. This can cause a loss of information and needs to be addressed with additional logic in the code or within the data set before import. Result data is converted to numeric as part of the data type conversion. This causes non-numeric data, such as less than and greater than results, to be converted to 'NA'.
+The 2017-2018 data set was filtered on data import to contain the following columns: seqn, lbxsassi (Aspartate Aminotransferase [AST; IU/L]) performed on the Roche Cobas 6000 (c501 module), riagendr (gender), ridageyr (age in years), alq121 (Alcohol consumption in past year), mcq170l (Do you currently have a liver condition), mcq510a (fatty liver), mcq510b (liver fibrosis), mcq510c (liver cirrhosis), mcq510d (viral hepatitis), mcq510e (autoimmune hepatitis), and mcq510f (other liver disease). The 2015-2016 data set was filtered on data import to contain seqn, riagendr (gender), ridageyr (age in years), and lbxtst (testosterone [Test; ng/dL]) performed by liquid chromatography tandem mass spectrometry (LC-MS/MS). 
+
+## Partitions  
+
+The full data set was first separated based on analyte then on sex and/or age for the examples. For this example, AST had no partitions (n = `r n_ast`), while testosterone was partitioned based on sex and into age groups (F: `r nrow(test_age_f)`, M:`r nrow(test_age_m)`). Analysis of variance testing (ANOVA) can be performed to determine partitions if the following assumptions are met; the residuals are normally distributed (approximately), the population variances are equal, and the observations are independent. When variance is unknown the 2-sample Welch's t-test can be used. The Kruskal-Wallis test is a non-parametric method similar to 1-way ANOVA. Tukey multiple pairwise-comparisons (TukeyHSD) is used for determining which group means differ from others in the group.  For a tutorial on one-way ANOVA testing, an available resource is <http://www.sthda.com/english/wiki/one-way-anova-test-in-r>. 
+
+## Normalization
+
+The fitdistrplus package was used to perform the statistical summary of the data set including the kurtosis, skewness, and to plot a histogram of the data set. All data transformations were performed using the Yeo-Johnson method as deployed by the bestNormalize package.
+
+## Outliers
+
+The detection of outliers or extreme values can be done with either an univariate approach, such as the Tukey method (Horn’s Algorithm [@RN239]) for parametric data or the Dixon method for non-parametric data or a multivariate approach. The Tukey method for outlier detection was applied to these data sets.
+
+## Identifying Reference Intervals
+
+A resampling bootstrap method using the mosaic package set at 500 iterations in conjunction with a modern maximum likelihood method from the mixtools package [@RN218], were used to identify RIs. Multiple permutations of the data set were applied for RIs identification. For comparison purposes, RIs were estimated with transformed and non-tranformed data with and without outlier removal. The RIs are summarized and saved to csv file for review. 
+
+# Results and Discussion
+
+## Data Import [Code Block 1]
+
+Data is paramount to indirect RIs. Ideally, indirect RIs are determined using all the data available. However, there are parameters within the data that should be addressed and/or recognized before importing data. The first parameter to understand is data stability or data history. Have the data sets changed such that they will require adjustments. Common changes to consider are instrument or assay changes which often occur in data collected over long periods. A second parameter to understand is the changing of patient demographics and/or populations over time including the dynamics around in- and out-patients. Generally, in-patients are admitted due to a pathological or surgical event which often shifts assay results. Indirect data sets can give incorrect RI results when more data is pathological than normal or if the assay is used in a select population with a high probability of disease. 
+For purposes of this example, the data set did not require separation of out- and in-patient information. However, typical hospital acquired data set would require in-patient data exclusion which can be performed by a combination of dplyr from tidyverse and stringr. Stringr is a package that employs regex, a language for working with text data. 
+
+```{r test_import_2}
+## Code Block 1: 
+## Data import ##
+# read in data
+demo_data_2015 <- haven::read_xpt(here::here
+                 ("data",
+                   "DEMO_I.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, riagendr, ridageyr)
+
+testo_data <- haven::read_xpt(here::here
+                 ("data",
+                   "TST_I.XPT")) %>%
+  janitor::clean_names() %>%
+  dplyr::select(seqn, lbxtst)
+
+# join data from two sources
+testo_ri <- full_join(testo_data, 
+                      demo_data_2015, 
+                      by = "seqn")
+```
+
+## Data Wrangling [Code Block 2 & 3]
+
+Data type checks were performed and adjusted as needed with either R base functions (e.g., as.numeric and as.factor) or date functions (e.g., convert_to_datetime) from the janitor package. Following data type adjustment, data cleaning should be performed which can include various processes dependent on the data set. When applying functions, non-conforming data is often converted to ‘NA’ values. These can be removed through the drop_na function from the tidyr package (tidyverse) before proceeding. For data sets that are severely left-shifted a significant portion of the data could be removed due to being less than results. For these data sets, this pipeline is not ideal and other methods would need to be used.    
+The most common partitioning requirements are sex and age. Sex usually has three possible entries of female, male and unknown. Unknown sex often has limited data that make it unsuitable for downstream processing so should be removed for sex partitioning. For data extracted from a laboratory information system (LIS) or electronic health record (EHR), the age in the system can come in different formats which include day, month, or year. To simplify downstream processes including age partitioning, age calculated in days is the most useful in a pediatric setting and years in an adult population. The eeptools package provides useful tools for calculating age through the age_calc function. AST was chosen as an example due to the availability of the self reported alcohol consumption and liver disease status which is known to impact AST result. AST data was filtered if the patient was known to have a liver condition. 
+
+```{r data_cleanup, fig.height=4, fig.width=3.5}
+## Code Block 2: 
+## Data Wrangling ##
+# check data types
+#glimpse(testo_ri) #Remove comment '#' to use.
+
+# adjust datatypes
+testo_ri$riagendr <- 
+  testo_ri$riagendr %>%
+  dplyr::recode(`1` = "M", `2` = "F", 
+                .default = NA_character_) %>%
+  as.factor() 
+
+testo_ri$seqn <- as.character(testo_ri$seqn)
+
+# remove NAs from results 
+testo_ri <- testo_ri %>% 
+  drop_na(lbxtst) 
+
+testo_ri <- testo_ri %>% 
+  filter(ridageyr > 17)
+
+# Remove those with known liver conditions
+ast_ri <- ast_ri %>%
+  dplyr::filter(is.na(mcq510a)) %>%
+  filter(is.na(mcq510b)) %>%
+  filter(is.na(mcq510c)) %>%
+  filter(is.na(mcq510d)) %>%
+  filter(is.na(mcq510e)) %>%
+  filter(is.na(mcq510f))
+```
+
+For the alcohol consumption category (alq121) zero codes for no alcohol consumption while 1-10 code for 1 having the most frequent consumption and 10 being the lowest frequency. A histogram or scatterplot of the condition being tested vs the analytes' concentration is easy way to quickly visualize possible breakpoints in the data. As the frequency of alcohol increases there is a broadening of the standard deviation and an slight increase in the median and extreme values (Figure 2). 
+
+```{r alcohol_fig, fig.width=3.5, fig.height=4, echo=FALSE, results='hide'}
+ast_ri$alq121 <- as.factor(ast_ri$alq121)
+ast_ri_plot <- ast_ri %>%
+  dplyr::filter(alq121 != 77, alq121 != 99) %>%
+  drop_na(alq121) %>%
+  mutate(name = factor(alq121, levels = c("0", "10", "9", "8", "7", "6", "5", "4", "3", "2","1"))) %>%
+  ggplot(aes(x = name, y = lbxsassi )) +
+  geom_boxplot() +
+  xlab("Alq121 Code") +
+  ylab("AST (IU/L)")
+
+ggsave(filename = here::here("results", "new_figs",
+                   "figure_2.jpeg"), plot = ast_ri_plot)
+```
+```{r ast_etoh_stats2, include=FALSE}
+
+ast <- ast_ri %>%
+  dplyr::filter(alq121 != 77, alq121 != 99)
+ast_anova.liver <- anova_test(
+  ast, ast$lbxsassi, ast$alq121)
+
+ast.anova.df1 <-  as.data.frame(
+  as.matrix(ast_anova.liver[[3]]$c2))
+
+ast_sig1 <- ast.anova.df1 %>%
+  dplyr::filter(`p adj` < 0.05)
+
+ast_ri <- ast_ri %>%
+  dplyr::filter(!alq121 %in% c(77,99,4,3,2,1))
+
+ast <- ast_ri
+ast_anova.liver.etoh <- anova_test(
+  ast, ast$lbxsassi, ast$alq121)
+
+ast.anova.df1 <-  as.data.frame(
+  as.matrix(ast_anova.liver.etoh[[3]]$c2))
+
+ast_sig2 <- ast.anova.df1 %>%
+  dplyr::filter(`p adj` < 0.05)
+
+```
+
+Based on Figure 2, a break should occur either at group 3 or group 4 with group 4 corresponding to having an alcoholic beverage more than once a month. From the three statistical methods (ANOVA, Welch's t-test, and Kruskal-Wallis test), The Kruskal-Wallis test is the most appropriate test for this data set and comparison and was found to be significant. The ANOVA, Welch's t-test, and Kruskal-Wallis tests will determine if there are significant differences, but these test are unable to identify which are different. The TukeyHSD statistcal test is able to identify which are different. When the TukeyHST test was performed on the AST data versus the alcohol consumption there were `r nrow(ast_sig1)` significant differences based on a p-value of <=0.05. These differences were mainly between groups 1-4 and all other groups. When groups 1-4 were removed and the TukeyHSD test performed there were no significant differences between the groups. A similar procedure can be used for the *de novo* determination of age and sex partitions.  
+
+```{r ast_etoh_stats}
+## Code Block 3: 
+## Data Wrangling/Partitioning Statistics ##
+ast <- ast_ri %>%
+  dplyr::filter(alq121 != 77, alq121 != 99)
+ast_anova.liver <- anova_test(
+  ast, ast$lbxsassi, ast$alq121)
+
+ast.anova.df1 <-  as.data.frame(
+  as.matrix(ast_anova.liver[[3]]$c2))
+
+ast_sig1 <- ast.anova.df1 %>%
+  dplyr::filter(`p adj` < 0.05)
+
+ast_ri <- ast %>%
+  dplyr::filter(alq121 != 4, alq121 != 3, 
+                alq121 != 2, alq121 != 1)
+ast <- ast_ri
+ast_anova.liver.etoh <- anova_test(
+  ast, ast$lbxsassi, ast$alq121)
+
+ast.anova.df1 <-  as.data.frame(
+  as.matrix(ast_anova.liver.etoh[[3]]$c2))
+
+ast_sig2 <- ast.anova.df1 %>%
+  dplyr::filter(`p adj` < 0.05)
+
+```
+
+## Partitions [Code Block 4]
+
+Partitioning statistics can be broken into two different use cases. The first use case is for the *de novo* determination of partitions. There are multiple statistical techniques that are useful for identifying partitions, such as those used above for data wrangling/partitioning ANOVA, Welch's t-test, and Kruskal–Wallis. Figure 2 plots the age versus the concentration of AST and Testo with gender identified. From figure 2 a slight gender separation can be seen for AST, but when statistical test are applied it is considered insignificant. There is a major split among age and gender for Testo which is verified by statistical test. The code is available for *de novo* partitions in the full code (code block test_denovo_partition1); however, as an example partitions will be made based on existing reference intervals from a reference laboratory.  For other statistical methods to determine partitions see Ichihara et al. which details current recommended statistical methods (univariate and multivariate) for identifying sources of variation in the data set [@RN222]. The caveat of multivariate techniques is they require prior knowledge of the analyte in question. The second use case for partitioning statistics is to determine if an analyte data set recapitulates the partitions recommended elsewhere, such as published or in use RI. Frequently, the laboratory wants to compare newly derived RIs with existing RIs. There are a few common partitioning statistics to determine whether there is a significant difference between RIs. When comparing to an existing RI without the original data set available for analysis, the Harris-Boyd method can be used even with the general downsides outlined by Lahti (Table 2) [@RN226]. The mean and standard deviation can be ascertained from a RI based on the mean equals [(Upper Limit – Lower Limit)/2 + Lower Limit] and the standard deviation equals (Upper Limit – Lower Limit)/4 assuming the RI is based on a central 95%. The number of patient samples after exclusion, cleaning, and outlier removal included in each partition are in Table 1 and ranged from `r min(as.numeric(sample_number_before)-as.numeric(sample_number_after_nontrans))` to `r max(as.numeric(sample_number_before)-as.numeric(sample_number_after_nontrans))`. All partitions had greater than 120 samples which is the minimum recommended for establishing a RI in a direct data collection scheme [@RN38] except the male 14 year partition.
+
+```{r partition_plots, fig.width=6, fig.height=4, echo=FALSE, results='hide'}
+everysecond <- function(x){
+  x <- sort(unique(x))
+  x[seq(2, length(x), 2)] <- ""
+  x
+}
+
+testo_ri$ridageyr <- as.numeric(
+  testo_ri$ridageyr)
+
+testo_ri_long <- testo_ri %>%
+    pivot_longer(
+    cols = c("lbxtst"), 
+    names_to = "analyte", 
+    values_to = "result"
+  )
+
+testo_ri_long <- testo_ri_long %>%
+  group_by(ridageyr, riagendr, analyte) %>%
+  mutate("median" = median(na.omit(result))) %>%
+  filter(!is.na(ridageyr)) %>%
+  arrange(ridageyr) %>%
+  distinct() 
+
+indirect_ri_long <- ast_ri %>%
+    pivot_longer(
+    cols = c("lbxsassi"), 
+    names_to = "analyte", 
+    values_to = "result"
+  )
+
+indirect_ri_long <- indirect_ri_long %>%
+  group_by(ridageyr, riagendr, analyte) %>%
+  dplyr::mutate("median" = median(
+    na.omit(result)))%>%
+  filter(!is.na(ridageyr)) %>%
+  arrange(ridageyr) %>%
+  distinct() 
+  
+
+
+p1 <- testo_ri_long %>%
+  filter(!is.na(median)) %>%
+  group_by(analyte)
+
+p2 <- indirect_ri_long %>%
+  filter(!is.na(median)) %>%
+  group_by(analyte)
+
+
+ ast.test.conc.v.age.plot <- ggplot() +
+    geom_point(data=p2, aes(
+      color = riagendr, x = ridageyr, y = median)) +
+    geom_point(data=p1, aes(
+      color = riagendr, x = ridageyr, y = median)) +
+    ylab("Median Concentration") +
+   xlab("Age (year)") +
+  facet_grid(. ~analyte)
+ggsave(filename = here::here("results", "new_figs", "figure_3.jpeg"))
+```
+
+```{r ast_partition, include=FALSE, fig.height=4, fig.width=3.5, echo=FALSE}
+# Data Partitions
+
+ast_age <- ast_ri %>%
+  dplyr::select(lbxsassi, riagendr, ridageyr) %>%
+  filter(!is.na(lbxsassi)) %>%
+  filter(!is.na(ridageyr)) 
+
+ast_anova.age <- anova_test(
+  ast_age, ast_age$lbxsassi, 
+  as.factor(ast_age$ridageyr))
+
+ast.anova.df <-  as.data.frame(
+  as.matrix(ast_anova.age[[3]]$c2))
+
+ast.anova.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+plot(ast_anova.age[[1]],2)
+```
+
+```{r test_denovo_partition, include=FALSE}
+test_age <- testo_ri %>%
+  dplyr::select(lbxtst, riagendr, ridageyr) %>%
+  filter(!is.na(lbxtst)) %>%
+  filter(!is.na(ridageyr)) %>%
+  filter(!is.na(riagendr))
+
+
+#### Males ####
+test_age_m <- test_age %>%
+  filter(riagendr == "M")
+
+test_anova_m_age <- anova_test(
+  test_age_m, test_age_m$lbxtst, 
+  as.factor(test_age_m$ridageyr))
+test.anova.m.df <-  as.data.frame(
+  as.matrix(test_anova_m_age[[3]]$c2))
+
+test.anova.m.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+# Based on these results I believe there is a split
+# 19-69, 70-80. However, looking at these in
+# smaller groups 19-30, 31-80 seems to work better.
+testo_19_30 <- test_age_m %>%
+  filter(as.numeric(as.character(ridageyr)) > 18 
+         & as.numeric(as.character(ridageyr)) < 31)
+
+testo_aov_19_30 <- anova_test(
+  testo_19_30, testo_19_30$lbxtst, 
+  as.factor(testo_19_30$ridageyr))
+testo_aov_19_30.df <-  as.data.frame(
+  as.matrix(testo_aov_19_30[[3]]$c2))
+
+testo_aov_19_30.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+testo_31_80 <- test_age_m %>%
+  filter(as.numeric(as.character(ridageyr)) > 30 
+         & as.numeric(as.character(ridageyr)) < 81)
+
+testo_aov_31_80 <- anova_test(
+  testo_31_80, testo_31_80$lbxtst, 
+  as.factor(testo_31_80$ridageyr))
+testo_aov_31_80.df <-  as.data.frame(
+  as.matrix(testo_aov_31_80[[3]]$c2))
+
+testo_aov_31_80.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+#### Females ####
+
+test_age_f <- test_age %>%
+  filter(riagendr == "F")
+
+test_anova_f_age <- anova_test(
+  test_age_f, test_age_f$lbxtst, 
+  as.factor(test_age_f$ridageyr))
+test.anova.f.df <-  as.data.frame(
+  as.matrix(test_anova_f_age[[3]]$c2))
+
+test.anova.f.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+testo_f18_40 <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 17 
+         & as.numeric(as.character(ridageyr)) < 41)
+
+testo_aov_f18_40 <- anova_test(
+  testo_f18_40, testo_f18_40$lbxtst, 
+  as.factor(testo_f18_40$ridageyr))
+testo_aov_f18_40.df <-  as.data.frame(
+  as.matrix(testo_aov_f18_40[[3]]$c2))
+
+testo_aov_f18_40.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+testo_f41_80 <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 40 
+         & as.numeric(as.character(ridageyr)) < 81)
+
+testo_aov_f41_80 <- anova_test(
+  testo_f41_80, testo_f41_80$lbxtst, 
+  as.factor(testo_f41_80$ridageyr))
+testo_aov_f41_80.df <-  as.data.frame(
+  as.matrix(testo_aov_f41_80[[3]]$c2))
+
+testo_aov_f41_80.df %>%
+  dplyr::filter(`p adj` < 0.05)
+
+
+```
+
+```{r test_reference_partition}
+## Code Block 4: 
+## Partitioning with Known Ranges ##
+test_age <- testo_ri %>%
+  dplyr::select(lbxtst, riagendr, ridageyr) %>%
+  filter(!is.na(lbxtst)) %>%
+  filter(!is.na(ridageyr)) %>%
+  filter(!is.na(riagendr))
+
+#### Males ####
+test_age_m <- test_age %>%
+  filter(riagendr == "M")
+
+# Using an existing RI from a reference 
+# lab the split will be  >= 19 for males and 
+# for female >= 19.
+
+testo_19_80_r <- test_age_m %>%
+  filter(as.numeric(as.character(ridageyr)) > 18 
+      & as.numeric(as.character(ridageyr)) < 81)
+
+#### Females ####
+
+test_age_f <- test_age %>%
+  filter(riagendr == "F")
+
+testo_f19_45_r <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 18 
+      & as.numeric(as.character(ridageyr)) < 46)
+
+testo_f46_80_r <- test_age_f %>%
+  filter(as.numeric(as.character(ridageyr)) > 45 
+      & as.numeric(as.character(ridageyr)) < 81)
+
+indirect_ri_list <- list(
+# No partitions needed.
+"AST_Both_All" = ast_ri %>% 
+    dplyr::select(lbxsassi),
+"Testo_M_19-80" = testo_19_80_r%>% 
+    dplyr::select(lbxtst),
+"Testo_F_20-45" = testo_f19_45_r %>% 
+    dplyr::select(lbxtst),
+"Testo_F_45-80" = testo_f46_80_r%>% 
+    dplyr::select(lbxtst)
+)
+```
+
+## Data Transformation [Code Block 5]
+
+The distribution of laboratory data is often non-Gaussian. However, many of the statistical techniques used for RI determination assume a Gaussian distribution of the data. Typically, skewness and kurtosis are used to determine the shape of the distribution. Ideally, a skewness of  0 ± 0.5 is approximately symmetric and a kurtosis of 3 ± 2 has insignificant tailing. For most clinical laboratory data, a transformation needs to be done if an approximation to a Gaussian curve is needed. Within a data pipeline where all data is treated in a similar fashion, the Yeo-Johnson transformation, a modification of the Box-Cox transformation, a historic normalizing transformation, is a universal transformation [@RN238]. Table 1 shows the statistical summary for each partition before and after transformation. Based on the skewness (0.3-0.8) and kurtosis (2.6-2.9), only the male Testo groups 12-13, 14, and 15-16 are approximately Gaussian before transformation. Once Yeo-Johnson transformation is performed all groups approximate a Gaussian curve with skewness from -0.1 to 0.3 and kurtosis from 1.9 to 5.2 on the high end. 
+
+```{r data_transformation}
+## Code Block 5:
+## Data Transformation ##
+# data.test is a custom function that  
+# uses the fitdistrplus package. For  
+# documentation purposes I produce the    
+# histograms and Cullen & Frey graphs.  
+# Stats are saved for the analytes pre  
+# and post transformation & outlier 
+# removal.
+
+# This code automatically prints histogram,
+# qq-plot, and Cullen & Frey graph 
+# pretransformation
+# indirect_ri_list %>%
+  # map_depth(data.test, .depth = 2)
+
+indirect_ri_list_trans <- 
+  indirect_ri_list %>%
+  map_depth(data.tran, .depth = 2)
+# Extract the transformed data
+indirect_ri_list_tran <-
+  lapply(indirect_ri_list_trans, 
+         '[[', 1)
+indirect_ri_list_tran <-
+  lapply(indirect_ri_list_tran, 
+         '[', 1)
+
+
+# These list are used to do the 
+# backtransformations downstream
+indirect_ri_list_tran1 <-
+  lapply(indirect_ri_list_trans, 
+         '[', 1)
+indirect_ri_list_tran1 <-
+  unlist(indirect_ri_list_tran1, 
+         recursive = F)
+
+# This code automatically prints histogram,
+# qq-plot, and Cullen & Frey graph 
+# posttransformation
+#  map(map(indirect_ri_list_tran1, "x.t"), data.test)
+```
+
+## Outlier Detection [Code Block 6]
+
+Theoretically, using the Tukey method on a Gaussian data set would remove 0.7% of the data from the tail [@RN222]. Outlier removal before transformation was `r min(round((as.numeric(sample_number_before)-as.numeric(sample_number_after_nontrans))/as.numeric(n_values$n)*100, 1))`% to `r max(round((as.numeric(sample_number_before)-as.numeric(sample_number_after_nontrans))/as.numeric(n_values$n)*100, 1))`% and after transformation was `r min(round((as.numeric(sample_number_before)-as.numeric(sample_number_after))/as.numeric(n_values$n)*100, 1))` to `r max(round((as.numeric(sample_number_before)-as.numeric(sample_number_after))/as.numeric(n_values$n)*100, 1))`%. This is not a drastic difference for those close to Gaussian, but can be significant for the groups that were least Gaussian (Table 1). To determine if the outlier removal changes the outcome of determining RI, the data set was subjected to four different workflows (Table 2): 1. transformed with outliers removed 2. transformed without outliers removed 3. No transformation with outliers removed 4. No transformation without outliers removed. Transformation had a noticeable impact on the RI outcome with ~3% difference in the outliers removed. As an example the female Testo groups has a upper limit mean RI estimate of `r map(map(RI_summary[4], "Upper Limit Mean" ),round, 1)` ng/dL while the non-transformed estimates were `r map(map(RI_summary_nt[4], "Upper Limit Mean" ),round, 1)` ng/dL and `r map(map(RI_summary_ntno[4], "Upper Limit Mean" ),round, 1)` ng/dL. Sometime negative estimates will be obtained and are often due to left shifted data which is usually resolved through transformation.
+
+
+```{r outlier_removal}
+## Code Block 6: 
+## Outlier detection and removal ##
+# Remove outliers using the custom    
+# remove.outlier function which uses  
+# the Tukey Method.
+indirect_ri_list_out <- 
+  indirect_ri_list_tran %>%
+  map_depth(remove.outlier, .depth = 2)
+```
+```{r outlier_removal_cont, include=FALSE}
+# Remove outliers using the remove.outlier   
+# function which uses the Tukey Method from 
+# transformed data 
+
+nontransformed_outliers <- 
+  indirect_ri_list %>%
+  map_depth(remove.outlier, .depth = 2)
+sample_number_after_nontrans <-
+  map(map(unlist(nontransformed_outliers, 
+                 recursive = F), 
+          na.omit), length)
+sample_number_after_nont <-
+  map(map(unlist(indirect_ri_list, 
+                 recursive = F), 
+          na.omit), length)
+
+# I record the number of samples removed 
+# through the Tukey Method
+sample_number_before <-
+  map(unlist(indirect_ri_list, 
+             recursive = F), length)
+sample_number_after <-
+  map(map(unlist(indirect_ri_list_out, 
+                 recursive = F), 
+          na.omit), length)
+```
+
+## Reference Intervals Determination [Code Bloc 7]
+
+RIs were estimated with and without transformation and with and without outliers removed. The results of the methods and expected RIs are in Table 2. The data pipeline can be utilized for Gaussian data without affecting the final RI determination (unpublished data). The following statistical calculation are performed to improve confidence in the estimated RI and allow one to compare the different estimate made in this tutorial. However, sometimes investigation into the reference RI and clinical discussion is warranted. The comparability of the estimated RI to established RIs are defined in Table 3 with z-scores, standard deviation ratios (SDR), and standard deviation indexes (SDI) calculations. Z-scores were compared to the critical z value (z5) defined by Harris & Boyd [@RN226], SDR is expected to be <1.6, and SDI is a measure of the number of SDs a mean deviates from a reference mean. The expected value for SDI would be zero, but >1.25 would be more than 1 SD away from the mean and would be concerning based on method comparison bias as such the cut-off used was 1.25. 
+The estimates for the transformed with outliers removed best recapitulates the laboratory reference intervals used based on the z-scores and SDRs. When the estimates do not recapitulate the reference used, further investigation into the data analysis, patient demographics, or diagnostic information in search for unaccounted data variation. Investigate the providence of reference RI and assay used to generate the data. Were the assays used to measure the data set different from those that were used to create the reference RI?  For the Testo data set and the reference laboratory LC-MS/MS assays were used. For AST, the reference RI and data set were performed on the same assay.
+An inherit limitations of this pipeline concerns the assumption of one healthy range and one pathological range yielding a bimodal distribution for the data set. This is coded into the custom mixtool function and the selection of the correct limits. The mixtools k-value, which is the number of components or modes, is set to two in this example. Since the k-value is at 2, the lambda value is set to >0.5 for the RI selection. The lambda value is a reflection of the amount of data under the RI estimate. With these settings in place, there are two issues that can occur. The first issue is a data set that has a majority of pathological data, resulting in a lambda value >0.5, thereby causing the selection of an incorrect RI estimate. The second issue is similar to the first, but is a case where analytes have two pathological intervals. In such cases, with an example being thyroid stimulating hormone (TSH), the k-value should be set to 3 and the selection of the lambda will require deeper investigation and possibly manual interruption. Additionally, this pipeline is not optimal for identifying RIs for an analyte with no expected healthy and pathological ranges. To guard against these issues, sample verification of any RI with a minimum of 20 patients samples prior to implementation is recommended.
+
+```{r data_reference_interval_determination, results='hide', cache=TRUE}
+## Code Block 7:
+## Reference Interval Estimation ##
+# The estimation is bootstrapped "n" times 
+# using resample from the mosaic package
+# To speed up the process, capture.output 
+# and invisible are included which helps  
+# when running n = 500. Mixtool.drb is a  
+# custom function that standardizes the   
+# mixtool parameters and allows mapping   
+# of the list. Mixtool.limits estimates 
+# the reference limits using the mixtool 
+# results.
+
+n <- 500
+
+analyte_name <- names(indirect_ri_list_out)
+
+indirect_ri_list_out <- 
+  unlist(indirect_ri_list_out, 
+         recursive = F)
+
+indirect_ref_list_ml <- map(1:n, 
+  ~ map(map(map(indirect_ri_list_out, 
+                na.omit), mixtool.drb), 
+        mixtool.limits))
+
+indirect_ref_list_ml <- 
+  transpose(indirect_ref_list_ml)
+indirect_ref_list_ml <- 
+  modify_depth(indirect_ref_list_ml, 1, 
+               transpose)
+
+```
+```{r RI_conversion, echo=FALSE, results='hide'}
+indirect_ri_list_trans <- 
+  unlist(indirect_ri_list_trans, 
+         recursive = F)
+
+RI_summary <- list()
+for(j in 1:length(indirect_ref_list_ml)) {
+  ref_int_summary <- list()
+
+  ref_int_summary[[analyte_name[[j]]]] <- list(
+  "Analyte Names" = analyte_name[[j]],
+  "n" = mean(as.numeric(indirect_ref_list_ml[[j]][["N"]])),
+  "Lower Limit Mean" = mean(na.omit(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$lower.limit), inverse = T)  )),
+  "Lower Limit Left CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$lower.limit), inverse = T)  )) - qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$lower.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit Right CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$lower.limit), inverse = T)  )) + qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$lower.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Lower Limit SD" = sd(  
+    predict(indirect_ri_list_trans[[j]], as.numeric(
+      indirect_ref_list_ml[[j]]$lower.limit), inverse = T),  
+    na.rm = TRUE  ),
+  "Upper Limit Mean" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$upper.limit), inverse = T)  )),
+  
+  "Upper Limit Left CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+indirect_ref_list_ml[[j]]$upper.limit), inverse = T)  )) - qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$upper.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit Right CI" = mean(na.omit(predict(indirect_ri_list_trans[[j]], as.numeric(
+  indirect_ref_list_ml[[j]]$upper.limit), inverse = T)  )) + qt(0.975, df =
+  n - 1) * sd(
+  predict(indirect_ri_list_trans[[j]], as.numeric(indirect_ref_list_ml[[j]]$upper.limit), inverse = T),
+  na.rm = TRUE
+  ) / sqrt(n),
+  "Upper Limit SD" = sd(
+    predict(indirect_ri_list_trans[[j]], as.numeric(
+      indirect_ref_list_ml[[j]]$upper.limit), inverse = T),  
+    na.rm = TRUE  ),
+  "Lambda Mean" = mean(
+    as.numeric(
+      na.omit(indirect_ref_list_ml[[j]]$lambda)))
+  )
+  
+  RI_summary[[analyte_name[[j]]]] <-
+  ref_int_summary[[analyte_name[[j]]]]
+}
+
+csv.out(RI_summary, "Indirect_RI_summary")
+
+```
+
+# Conclusion
+
+R can be used to create a robust statistical RI determination pipeline. A fully automated data pipeline may be difficult to achieve with all the clinical discrimination required while determining RI. However, each segment of the pipeline presented here allows for the review and further interrogation the data to help answer the clinical questions that arise during the RI determination process. 
+
+# Declaration of Competing Interests
+
+The authors declare that they have no known competing financial interests or personal relationships that could have appeared to influence the work reported in this paper.
+
+References {#references .numbered}
+==========
